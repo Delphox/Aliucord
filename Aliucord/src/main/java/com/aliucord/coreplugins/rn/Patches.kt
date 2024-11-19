@@ -209,6 +209,10 @@ fun patchStickers() {
     Patcher.addPatch(Sticker::class.java.getDeclaredMethod("b"), PreHook {
         if (formatType[it.thisObject] == StickerFormatType.UNKNOWN) it.result = ".gif"
     })
+        val formatTypePartial = StickerPartial::class.java.getDeclaredField("formatType").apply { isAccessible = true }
+    Patcher.addPatch(StickerPartial::class.java.getDeclaredMethod("b"), PreHook {
+        if (formatTypePartial[it.thisObject] == StickerFormatType.UNKNOWN) it.result = ".gif"
+    })
 }
 
 fun patchVoice() {
