@@ -3,33 +3,25 @@ package com.aliucord.coreplugins.forwardedmessages
 import android.content.Context
 import android.content.Intent
 import android.graphics.drawable.Drawable
-import android.net.ConnectivityManager
-import android.net.Network
-import android.net.NetworkCapabilities
+import android.net.*
 import android.os.Build
 import android.telephony.SignalStrength
 import android.telephony.TelephonyManager
 import android.view.View
-import android.widget.EditText
-import android.widget.LinearLayout
-import android.widget.TextView
-import android.widget.Toast
+import android.widget.*
 import androidx.appcompat.widget.Toolbar
 import androidx.core.content.ContextCompat
+import androidx.core.content.res.ResourcesCompat
 import androidx.core.widget.NestedScrollView
-import com.aliucord.Http
-import com.aliucord.utils.GsonUtils
-import com.aliucord.Utils
+import com.aliucord.*
 import com.aliucord.entities.CorePlugin
 import com.aliucord.patcher.PreHook
-import com.aliucord.patcher.Patcher
 import com.aliucord.utils.DimenUtils
-import com.discord.utilities.color.ColorCompat
+import com.discord.api.role.GuildRole
 import com.discord.databinding.WidgetIncomingShareBinding
-import com.aliucord.Constants
-import androidx.core.content.res.ResourcesCompat
 import com.discord.utilities.SnowflakeUtils
 import com.discord.utilities.captcha.CaptchaHelper
+import com.discord.utilities.color.ColorCompat
 import com.discord.utilities.intent.IntentUtils
 import com.discord.utilities.time.Clock
 import com.discord.widgets.chat.list.ViewEmbedGameInvite
@@ -37,6 +29,7 @@ import com.discord.widgets.chat.list.actions.WidgetChatListActions
 import com.discord.widgets.share.WidgetIncomingShare
 import com.discord.widgets.user.search.WidgetGlobalSearchModel
 import com.google.android.material.appbar.AppBarLayout
+import com.discord.utilities.view.text.SimpleDraweeSpanTextView
 import java.io.IOException
 import java.lang.reflect.Field
 import java.lang.reflect.Method
@@ -47,6 +40,10 @@ internal class ForwardMessages : CorePlugin(Manifest("ForwardMessages")) {
     private val forwardExtraContent = "com.aliucord.coreplugins.forwardedmessages.EXTRA_CONTENT"
     private val forwardExtraMessageId = "com.aliucord.coreplugins.forwardedmessages.EXTRA_MESSAGE_ID"
     private val forwardExtraChannelId = "com.aliucord.coreplugins.forwardedmessages.EXTRA_CHANNEL_ID"
+
+    init {
+        settingsTab = SettingsTab(ForwardSettings.Sheet::class.java, SettingsTab.Type.BOTTOM_SHEET)
+    }
 
     override fun start(context: Context) {
         val forwardId = View.generateViewId()
@@ -95,10 +92,27 @@ internal class ForwardMessages : CorePlugin(Manifest("ForwardMessages")) {
                         val messageContent = model.message.content
                         val channelId = model.channel.k()
 
+                        // Collect attachment info
+                        val attachments = try {
+                            val attachmentsField = model.message.javaClass.getDeclaredField("attachments").apply { isAccessible = true }
+                            attachmentsField.get(model.message) as? List<*>
+                        } catch (_: Throwable) { null }
+                        val attachmentInfo = attachments?.mapNotNull {
+                            val msgAttachment = it as? com.discord.api.message.attachment.MessageAttachment
+                            if (msgAttachment != null) {
+                                val wrapper = com.aliucord.wrappers.messages.AttachmentWrapper(msgAttachment)
+                                val map = java.util.HashMap<String, String>()
+                                map["filename"] = wrapper.filename ?: ""
+                                map["url"] = wrapper.proxyUrl ?: wrapper.url ?: ""
+                                map["type"] = wrapper.type?.name ?: ""
+                                map
+                            } else null
+                        }
                         val putExtra = Intent()
                             .putExtra(forwardExtraContent, messageContent)
                             .putExtra(forwardExtraMessageId, messageId)
                             .putExtra(forwardExtraChannelId, channelId)
+                            .putExtra("forwarded_attachments", attachmentInfo?.let { ArrayList(it) } ?: ArrayList<HashMap<String, String>>())
 
                         Utils.mainThread.post {
                             Utils.openPage(Utils.appActivity, WidgetIncomingShare::class.java, putExtra)
@@ -130,21 +144,120 @@ internal class ForwardMessages : CorePlugin(Manifest("ForwardMessages")) {
                 toolbar.title = "Forward"
 
                 val layout = binding.j.getChildAt(0) as LinearLayout
-
                 val shareToText = layout.getChildAt(4) as TextView
                 shareToText.text = "Forward To"
 
                 val messagePreviewText = layout.getChildAt(0) as TextView
                 messagePreviewText.text = "Optional Message"
 
-                val previewText = TextView(layout.context, null, 0, com.lytefast.flexinput.R.i.UiKit_TextAppearance)
+                // Message Preview Header
                 val messagePreviewCustom = TextView(layout.context, null, 0, com.lytefast.flexinput.R.i.UiKit_Search_Header)
                 messagePreviewCustom.text = "Message Preview"
-                previewText.text = messageContent
-                previewText.setPadding(DimenUtils.dpToPx(16), DimenUtils.dpToPx(2), 0, 0)
-
                 layout.addView(messagePreviewCustom, 0)
+
+                // Parsed Message Preview
+                val previewText = SimpleDraweeSpanTextView(layout.context)
+                val mediumTypeface = ResourcesCompat.getFont(layout.context, Constants.Fonts.whitney_medium)
+                if (mediumTypeface != null) previewText.typeface = mediumTypeface
+                val color = ColorCompat.getThemedColor(layout.context, com.lytefast.flexinput.R.b.colorInteractiveNormal)
+                previewText.setTextColor(color)
+                previewText.gravity = android.view.Gravity.CENTER_VERTICAL
+                // Further increase top and bottom padding to prevent emoji cropping
+                val extraPad = DimenUtils.dpToPx(16)
+                previewText.setPadding(
+                    previewText.paddingLeft,
+                    previewText.paddingTop + extraPad,
+                    previewText.paddingRight,
+                    previewText.paddingBottom + extraPad
+                )
+                // After setting text, force layout and set minHeight to lineHeight
+                previewText.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+                    val lh = previewText.lineHeight
+                    previewText.minHeight = lh
+                }
+
+                // Use Discord's message parser and AST renderer for mentions/emojis
+                val draweeBuilder = Class.forName("com.facebook.drawee.span.DraweeSpanStringBuilder").getConstructor().newInstance() as android.text.SpannableStringBuilder
+                val initialState = com.aliucord.utils.ReflectUtils.getField(
+                    com.discord.utilities.textprocessing.MessageParseState::class.java,
+                    null,
+                    "initialState"
+                ) as com.discord.utilities.textprocessing.MessageParseState
+                val ctx = com.discord.utilities.textprocessing.MessageRenderContext(
+                    layout.context,
+                    channelId,
+                    false,
+                    mutableMapOf<Long, String>(),
+                    mutableMapOf<Long, String>(),
+                    mutableMapOf<Long, GuildRole>(),
+                    0
+                )
+                val ast = com.aliucord.utils.MDUtils.parser.parse(messageContent ?: "", initialState)
+                ast.forEach { it.render(draweeBuilder, ctx) }
+                previewText.setText(draweeBuilder)
+                previewText.setPadding(DimenUtils.dpToPx(16), DimenUtils.dpToPx(2), 0, 0)
                 layout.addView(previewText, 1)
+
+                // Extract attachments from intent (fix deprecation and unchecked cast warnings)
+                @Suppress("DEPRECATION")
+                val attachmentsList = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                    intent.getSerializableExtra("forwarded_attachments", java.util.ArrayList::class.java) as? ArrayList<*>
+                } else {
+                    @Suppress("UNCHECKED_CAST")
+                    intent.getSerializableExtra("forwarded_attachments") as? ArrayList<*>
+                }
+                val safeAttachmentsList: List<Map<String, String>>? = attachmentsList?.mapNotNull {
+                    if (it is Map<*, *>) {
+                        @Suppress("UNCHECKED_CAST")
+                        it as? Map<String, String>
+                    } else null
+                }
+
+                if (attachmentsList != null && attachmentsList.isNotEmpty()) {
+                    // Add a horizontal LinearLayout for compact display
+                    val attachmentsLayout = LinearLayout(layout.context).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        setPadding(DimenUtils.dpToPx(16), DimenUtils.dpToPx(4), 0, 0)
+                    }
+                    // Limit to 3 images for compactness
+                    var imageCount = 0
+                    safeAttachmentsList?.forEach { att ->
+                        try {
+                            val filename = att["filename"] ?: ""
+                            val url = att["url"] ?: ""
+                            val type = att["type"] ?: ""
+                            val size = att["size"] ?: ""
+                            if (type.contains("IMAGE", true) && imageCount < 3) {
+                                val imageView = com.facebook.drawee.view.SimpleDraweeView(layout.context).apply {
+                                    val imgSize = DimenUtils.dpToPx(48)
+                                    layoutParams = LinearLayout.LayoutParams(imgSize, imgSize).apply {
+                                        setMargins(DimenUtils.dpToPx(2), 0, DimenUtils.dpToPx(2), 0)
+                                    }
+                                    scaleType = ImageView.ScaleType.CENTER_CROP
+                                }
+                                com.discord.utilities.icon.IconUtils.setIcon(imageView, url)
+                                com.discord.utilities.images.MGImages.setRoundingParams(imageView, 8f, false, null, null, null)
+                                attachmentsLayout.addView(imageView)
+                                imageCount++
+                            } else if (!type.contains("IMAGE", true)) {
+                                // File: show filename as clickable link, underline, themed color, and file size if available
+                                val fileNameView = TextView(layout.context).apply {
+                                    text = if (size.isNotEmpty()) "$filename ($size bytes)" else filename
+                                    setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
+                                    setTextColor(ColorCompat.getThemedColor(layout.context, com.lytefast.flexinput.R.b.colorInteractiveNormal))
+                                    paint.isUnderlineText = true
+                                    setPadding(DimenUtils.dpToPx(2), 0, DimenUtils.dpToPx(2), 0)
+                                    setOnClickListener {
+                                        Utils.openMediaViewer(url, filename)
+                                    }
+                                }
+                                attachmentsLayout.addView(fileNameView)
+                            }
+                        } catch (_: Throwable) {}
+                    }
+                    // Insert attachments below previewText
+                    layout.addView(attachmentsLayout, 2)
+                }
             })
 
         // Send forwarded message
@@ -179,7 +292,6 @@ internal class ForwardMessages : CorePlugin(Manifest("ForwardMessages")) {
                 Utils.threadPool.submit {
                     try {
                         val forwardMsg = Message(MessageReference(1, messageId, channelId, null, false), "")
-                        val forwardJson = try { GsonUtils.toJson(forwardMsg) } catch (e: Exception) { "<unable to serialize: ${e.message}>" }
 
                         val res = Http.Request
                             .newDiscordRNRequest(String.format("/channels/%d/messages", selectedChannel), "POST")
@@ -192,14 +304,16 @@ internal class ForwardMessages : CorePlugin(Manifest("ForwardMessages")) {
                         else {
                             if (commentMessage.isNotEmpty()) {
                                 val commentMsg = Message(null, commentMessage)
-                                
+
                                 val cres = Http.Request.newDiscordRNRequest(String.format("/channels/%d/messages", selectedChannel), "POST")
                                     .executeWithJson(commentMsg)
                                 val cresText = try { cres.text() } catch (e: Exception) { "<unable to read body: ${e.message}>" }
                             }
 
                             Utils.mainThread.post {
-                                Toast.makeText(context, "Message forwarded!", Toast.LENGTH_SHORT).show()
+                                if (ForwardSettings.showToast) {
+                                    Toast.makeText(context, "Message forwarded!", Toast.LENGTH_SHORT).show()
+                                }
                             }
                         }
                     } catch (e: IOException) {
